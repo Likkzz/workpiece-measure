@@ -2,8 +2,12 @@
 # FILE: app.py
 # LOCATION: workpiece_app/app.py
 # PURPOSE: Main Flask Web Server. 
-#          FIX: Added error handling in 'calculate_manual' to prevent crashes 
-#               if points are identical or invalid.
+#          FEATURES: 
+#          - AUTOMATIC BACKGROUND REMOVAL using rembg (New!)
+#          - CLAHE Segmentation (Handles shadows)
+#          - Pitch: Middle 5 Valleys
+#          - Depth: Line-to-Line distance
+#          - Diameters: 5th/95th percentile widths in Thread Region
 # =============================================================================
 
 import os
@@ -11,8 +15,11 @@ import cv2
 import numpy as np
 from flask import Flask, render_template, request, jsonify, send_from_directory
 from scipy import signal, ndimage
-from skimage import morphology, measure
+from skimage import morphology
 import math
+from rembg import remove  # Import background removal
+from PIL import Image     # Import PIL for image handling
+import io
 
 app = Flask(__name__)
 UPLOAD_FOLDER = 'uploads'
@@ -33,7 +40,6 @@ def extract_profile_data(bw):
     if len(rows) == 0: return None, None, None
 
     min_y, max_y = np.min(rows), np.max(rows)
-    
     margin = int((max_y - min_y) * 0.02) 
     start_y = min_y + margin
     end_y = max_y - margin
@@ -47,7 +53,6 @@ def extract_profile_data(bw):
         if len(row_pixels) > 0:
             l = row_pixels[0]
             r = row_pixels[-1]
-            
             widths.append(r - l)
             right_profile.append(r)
             valid_y.append(y)
@@ -58,8 +63,7 @@ def find_threaded_region(profile_x, profile_y):
     if len(profile_x) < 100: return None, None 
 
     window_size = 50 
-    roughness = [np.std(profile_x[i:i+window_size]) 
-                 for i in range(len(profile_x) - window_size)]
+    roughness = [np.std(profile_x[i:i+window_size]) for i in range(len(profile_x) - window_size)]
     
     if len(roughness) > 10:
         smooth_roughness = signal.savgol_filter(roughness, 9, 2)
@@ -68,7 +72,6 @@ def find_threaded_region(profile_x, profile_y):
 
     max_roughness_robust = np.percentile(smooth_roughness, 95)
     threshold = max_roughness_robust * 0.3 
-    
     rough_indices = np.where(smooth_roughness > threshold)[0]
 
     if len(rough_indices) == 0: return None, None
@@ -91,10 +94,8 @@ def find_threaded_region(profile_x, profile_y):
     if best_start_idx is not None and best_end_idx is not None:
         detected_height = best_end_idx - best_start_idx
         buffer = int(detected_height * 0.15)
-        
         start_idx = max(0, best_start_idx - buffer)
         end_idx = min(len(profile_y) - 1, best_end_idx + buffer)
-        
         return start_idx, end_idx
     else:
         return None, None
@@ -173,11 +174,21 @@ def process_auto_metrics(image_path):
     img = cv2.imread(image_path)
     if img is None: return None
     
-    if len(img.shape) == 3:
+    # NOTE: Image is already processed by rembg in upload_image, so background is transparent (alpha=0)
+    # We need to handle RGBA or convert transparent pixels to black
+    
+    if len(img.shape) == 3 and img.shape[2] == 4: # RGBA
+        # Extract Alpha channel
+        alpha = img[:, :, 3]
+        gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
+        # Where alpha is 0 (transparent), make gray 0 (black)
+        gray[alpha == 0] = 0
+    elif len(img.shape) == 3: # RGB/BGR
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     else:
         gray = img.copy()
 
+    # CLAHE & Segmentation
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
     gray_enhanced = clahe.apply(gray)
     blur = cv2.GaussianBlur(gray_enhanced, (7, 7), 0)
@@ -194,6 +205,7 @@ def process_auto_metrics(image_path):
     bw_bool = morphology.remove_small_objects(bw_bool, 5000)
     bw = bw_bool.astype(np.uint8) * 255
     
+    # Contour for visualization
     contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     viz_contour = []
     if contours:
@@ -202,6 +214,7 @@ def process_auto_metrics(image_path):
         approx = cv2.approxPolyDP(cnt, epsilon, True)
         viz_contour = approx.reshape(-1, 2).tolist()
     
+    # Orientation
     y_idx, x_idx = np.nonzero(bw)
     if len(y_idx) == 0: return None
     
@@ -218,9 +231,11 @@ def process_auto_metrics(image_path):
     cx, cy = int(mu[0]), int(mu[1])
     rot_bw = rotate_image(bw, rotation_angle, (cx, cy)) > 127
 
+    # Extract Data
     widths, right_profile, valid_y = extract_profile_data(rot_bw)
     if widths is None: return None
 
+    # Bounding Box
     rot_y, rot_x = np.nonzero(rot_bw)
     min_ry, max_ry = np.min(rot_y), np.max(rot_y)
     min_rx, max_rx = np.min(rot_x), np.max(rot_x)
@@ -239,11 +254,13 @@ def process_auto_metrics(image_path):
     for p in box_orig:
         vis_bounding_box.append([float(p[0]), float(p[1])])
 
+    # Thread Region
     start_idx, end_idx = find_threaded_region(right_profile, valid_y)
     if start_idx is None:
         start_idx = int(len(valid_y) * 0.15)
         end_idx = int(len(valid_y) * 0.75)
 
+    # --- METRICS ---
     length_px = max_ry - min_ry
     
     thread_zone_widths = widths[start_idx:end_idx]
@@ -371,11 +388,28 @@ def upload_image():
     file = request.files['file']
     if file.filename == '': return jsonify({'error': 'No selected file'})
     
+    # 1. Save Raw Image
     filename = file.filename
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    file.save(filepath)
+    raw_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(raw_path)
     
-    metrics = process_auto_metrics(filepath)
+    # 2. Remove Background using REMBG
+    try:
+        with open(raw_path, 'rb') as i:
+            input_data = i.read()
+            output_data = remove(input_data)
+            
+        # Overwrite raw image with clean image
+        # Or save as new file. Let's overwrite to keep it simple for process_auto_metrics
+        with open(raw_path, 'wb') as o:
+            o.write(output_data)
+            
+    except Exception as e:
+        print(f"Background removal failed: {e}")
+        # Proceed with raw image if rembg fails (better than crash)
+    
+    # 3. Process Clean Image
+    metrics = process_auto_metrics(raw_path)
     if not metrics: return jsonify({'error': 'Processing failed'})
     
     return jsonify({'image_url': f'/uploads/{filename}', 'auto_data': metrics})
@@ -388,22 +422,14 @@ def calculate_manual():
         if len(points) != 4: return jsonify({'error': 'Error: Need exactly 4 points'})
         
         p1, p2, v1, v2 = [np.array(p) for p in points]
-        
-        # Calculate Pitch
         peak_pitch = np.linalg.norm(p2 - p1) * SCALE_AXIS
         valley_pitch = np.linalg.norm(v2 - v1) * SCALE_AXIS
         final_pitch = (peak_pitch + valley_pitch) / 2
         
-        # Calculate Depth (Safety Logic)
         def get_line(pa, pb): return pb[1]-pa[1], pa[0]-pb[0], pb[0]*pa[1]-pa[0]*pb[1]
         A, B, C = get_line(p1, p2)
-        
-        # Prevention of div by zero if points are identical
-        if A == 0 and B == 0:
-            return jsonify({'error': 'Points cannot be identical'})
-
+        if A == 0 and B == 0: return jsonify({'error': 'Points cannot be identical'})
         def dist(pt, A, B, C): return abs(A*pt[0] + B*pt[1] + C) / math.sqrt(A**2 + B**2)
-        
         d1 = dist(v1, A, B, C)
         d2 = dist(v2, A, B, C)
         final_depth = ((d1 + d2) / 2) * SCALE_PERP
@@ -413,7 +439,6 @@ def calculate_manual():
             'depth_mm': round(float(final_depth), 4)
         })
     except Exception as e:
-        print(f"Manual calculation error: {e}")
         return jsonify({'error': 'Calculation Error'}), 500
 
 if __name__ == '__main__':
