@@ -3,7 +3,8 @@ opencv-python-headless
 numpy
 scipy
 scikit-image
-
+onnxruntime
 gunicorn
 rembg
 Pillow
+
