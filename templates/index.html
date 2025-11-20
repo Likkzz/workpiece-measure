@@ -1,0 +1,405 @@
+<!-- 
+    FILE: templates/index.html
+    LOCATION: workpiece_app/templates/index.html
+    PURPOSE: Frontend for Manual Measurement with Reset Fix.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Workpiece Measurement</title>
+    <style>
+        body { font-family: sans-serif; background: #1a1a1a; color: #eee; margin: 0; display: flex; flex-direction: column; height: 100vh; }
+        header { padding: 15px; background: #333; display: flex; justify-content: space-between; align-items: center; }
+        
+        .container { display: flex; flex: 1; overflow: hidden; position: relative; }
+        .sidebar { width: 300px; min-width: 300px; background: #252525; padding: 20px; overflow-y: auto; border-right: 1px solid #444; z-index: 10; }
+        .main-view { flex: 1; position: relative; background: #000; overflow: hidden; cursor: grab; width: 100%; height: 100%; }
+        .main-view:active { cursor: grabbing; }
+
+        .btn { padding: 10px 15px; border: none; cursor: pointer; font-weight: bold; border-radius: 4px; width: 100%; margin-bottom: 10px; }
+        .btn-primary { background: #007bff; color: white; }
+        .btn-secondary { background: #6c757d; color: white; }
+        .btn-reset { background: #dc3545; color: white; }
+        input[type="file"] { margin-bottom: 15px; width: 100%; }
+
+        .stat-box { background: #333; padding: 10px; border-radius: 4px; margin-bottom: 15px; }
+        .stat-label { font-size: 0.85em; color: #aaa; }
+        .stat-value { font-size: 1.2em; font-weight: bold; color: #fff; }
+        .auto-highlight { color: #4cd137; }
+
+        .instructions { background: #444; padding: 10px; border-radius: 4px; margin-bottom: 20px; font-size: 0.9em; line-height: 1.4; }
+        canvas { display: block; } 
+    </style>
+</head>
+<body>
+
+<header>
+    <h3>Workpiece Measurement Tool</h3>
+</header>
+
+<div class="container">
+    <div class="sidebar">
+        <h4>1. Upload Image</h4>
+        <input type="file" id="imageInput" accept="image/*">
+        <button class="btn btn-primary" onclick="uploadImage()">Process Image</button>
+
+        <div id="resultsArea" style="display:none;">
+            <h4>Auto Results</h4>
+            <div class="stat-box">
+                <div class="stat-label">Total Length</div>
+                <div class="stat-value" id="autoLength">-</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">Outer Diameter</div>
+                <div class="stat-value" id="autoOD">-</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">Core Diameter</div>
+                <div class="stat-value" id="autoCore">-</div>
+            </div>
+
+            <!-- AUTO Thread Metrics -->
+            <div class="stat-box">
+                <div class="stat-label">Auto Pitch (<span id="valleyCount">0</span> valleys)</div>
+                <div class="stat-value auto-highlight" id="autoPitch">-</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-label">Auto Depth (<span id="peakCount">0</span> peaks)</div>
+                <div class="stat-value auto-highlight" id="autoDepth">-</div>
+            </div>
+
+            <h4>Manual Verification</h4>
+            <div class="instructions" id="instructionText">
+                <span style="color:#ff3b30">● Red</span> = Peaks<br>
+                <span style="color:#00d2d3">● Cyan</span> = Valleys (Used)<br>
+                <span style="color:#7f8c8d">● Gray</span> = Valleys (Ignored)<br>
+                <span style="color:#00a8ff">-- Box</span> = Outer Boundary<br>
+                ---<br>
+                Click 4 points to override.
+            </div>
+            <div style="display: flex; gap: 5px;">
+                <button class="btn btn-secondary" onclick="fitImage()">Fit Image</button>
+                <button class="btn btn-reset" onclick="resetPoints()">Manual Reset</button>
+            </div>
+
+            <div id="manualResults" style="display:none;">
+                <h4>Manual Results</h4>
+                <div class="stat-box">
+                    <div class="stat-label">Manual Pitch</div>
+                    <div class="stat-value" id="finalPitch" style="color: #e1b12c">-</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-label">Manual Depth</div>
+                    <div class="stat-value" id="finalDepth" style="color: #e1b12c">-</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="main-view" id="canvasContainer">
+        <canvas id="imgCanvas"></canvas>
+    </div>
+</div>
+
+<script>
+    let canvas = document.getElementById('imgCanvas');
+    let ctx = canvas.getContext('2d');
+    let container = document.getElementById('canvasContainer');
+    
+    let img = new Image();
+    let autoPoints = { peaks: [], valleys: [], valleys_used: [], line_peaks: [], line_valleys: [], vis_outer_dia: [], vis_core_dia: [] };
+    let visBoundingBox = []; 
+    let detectedContour = []; 
+    let manualPoints = []; 
+    
+    let scale = 1;
+    let pX = 0;
+    let pY = 0;
+    let isDragging = false;
+    let startX, startY;
+
+    function resizeCanvas() {
+        if (container.clientWidth > 0 && container.clientHeight > 0) {
+            canvas.width = container.clientWidth;
+            canvas.height = container.clientHeight;
+            draw();
+        }
+    }
+    window.addEventListener('resize', resizeCanvas);
+    setTimeout(resizeCanvas, 100); 
+
+    function fitImage() {
+        if (!img.src || img.width === 0) return;
+        resizeCanvas();
+        let scaleX = canvas.width / img.width;
+        let scaleY = canvas.height / img.height;
+        scale = Math.min(scaleX, scaleY) * 0.9;
+        pX = (canvas.width - img.width * scale) / 2;
+        pY = (canvas.height - img.height * scale) / 2;
+        draw();
+    }
+
+    async function uploadImage() {
+        let input = document.getElementById('imageInput');
+        if(input.files.length === 0) return alert("Select a file first");
+
+        let formData = new FormData();
+        formData.append('file', input.files[0]);
+
+        let resp = await fetch('/upload', { method: 'POST', body: formData });
+        let data = await resp.json();
+        window.latestData = data;
+
+        if(data.error) return alert(data.error);
+
+        document.getElementById('resultsArea').style.display = 'block';
+        document.getElementById('autoLength').innerText = data.auto_data.length_mm + " mm";
+        document.getElementById('autoOD').innerText = data.auto_data.od_mm + " mm";
+        document.getElementById('autoCore').innerText = data.auto_data.core_mm + " mm";
+        
+        if (data.auto_data.thread_metrics && Object.keys(data.auto_data.thread_metrics).length > 0) {
+            document.getElementById('autoPitch').innerText = data.auto_data.thread_metrics.pitch_mm + " mm";
+            document.getElementById('autoDepth').innerText = data.auto_data.thread_metrics.depth_mm + " mm";
+            document.getElementById('peakCount').innerText = data.auto_data.thread_metrics.count_peaks;
+            document.getElementById('valleyCount').innerText = data.auto_data.thread_metrics.count_valleys_used;
+        } else {
+            document.getElementById('autoPitch').innerText = "Failed";
+            document.getElementById('autoDepth').innerText = "-";
+            document.getElementById('peakCount').innerText = "0";
+            document.getElementById('valleyCount').innerText = "0";
+        }
+
+        img.onload = function() {
+            manualPoints = [];
+            autoPoints = { peaks: [], valleys: [], valleys_used: [], line_peaks: [], line_valleys: [], vis_outer_dia: [], vis_core_dia: [] };
+            visBoundingBox = [];
+            detectedContour = [];
+            
+            if(data.auto_data.all_points) {
+                autoPoints = data.auto_data.all_points;
+            }
+            if(data.auto_data.vis_bounding_box) {
+                visBoundingBox = data.auto_data.vis_bounding_box;
+            }
+            
+            if(data.auto_data.contour) {
+                detectedContour = data.auto_data.contour;
+            }
+            
+            fitImage(); 
+        };
+        img.src = data.image_url;
+    }
+
+    function draw() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.save();
+        ctx.translate(pX, pY);
+        ctx.scale(scale, scale);
+
+        if(img.src) ctx.drawImage(img, 0, 0);
+
+        let markerSize = 6 / scale;
+        
+        // Draw Contour
+        if(detectedContour.length > 0) {
+            ctx.beginPath();
+            ctx.moveTo(detectedContour[0][0], detectedContour[0][1]);
+            for(let i=1; i<detectedContour.length; i++) {
+                ctx.lineTo(detectedContour[i][0], detectedContour[i][1]);
+            }
+            ctx.closePath();
+            ctx.lineWidth = 2 / scale;
+            ctx.strokeStyle = '#4cd137'; // Bright Green
+            ctx.stroke();
+        }
+
+        // Draw Peaks
+        if(autoPoints.peaks) {
+            ctx.fillStyle = '#ff3b30'; 
+            autoPoints.peaks.forEach(p => {
+                ctx.beginPath();
+                ctx.arc(p[0], p[1], markerSize, 0, 2 * Math.PI);
+                ctx.fill();
+            });
+        }
+
+        // Draw Valleys
+        if(autoPoints.valleys) {
+            let usedSet = new Set();
+            if(autoPoints.valleys_used) {
+                autoPoints.valleys_used.forEach(p => usedSet.add(p[0] + "," + p[1]));
+            }
+            autoPoints.valleys.forEach(p => {
+                ctx.beginPath();
+                ctx.arc(p[0], p[1], markerSize, 0, 2 * Math.PI);
+                if (usedSet.has(p[0] + "," + p[1])) {
+                    ctx.fillStyle = '#00d2d3'; 
+                } else {
+                    ctx.fillStyle = '#7f8c8d'; 
+                }
+                ctx.fill();
+            });
+        }
+
+        // Draw Best-Fit Lines
+        if(autoPoints.line_peaks && autoPoints.line_peaks.length === 2) {
+            drawLine(autoPoints.line_peaks, 'yellow', 2 / scale, [5/scale, 5/scale]);
+        }
+        if(autoPoints.line_valleys && autoPoints.line_valleys.length === 2) {
+            drawLine(autoPoints.line_valleys, 'yellow', 2 / scale, [5/scale, 5/scale]);
+        }
+
+        // Draw Outer Bounding Box
+        if (visBoundingBox.length === 4) {
+            ctx.beginPath();
+            ctx.moveTo(visBoundingBox[0][0], visBoundingBox[0][1]);
+            for (let i = 1; i < 4; i++) {
+                ctx.lineTo(visBoundingBox[i][0], visBoundingBox[i][1]);
+            }
+            ctx.closePath();
+            ctx.lineWidth = 2 / scale;
+            ctx.setLineDash([15 / scale, 15 / scale]); 
+            ctx.strokeStyle = '#00a8ff'; 
+            ctx.stroke();
+            ctx.setLineDash([]); 
+        }
+        
+        // Draw Dia Lines
+        if (autoPoints.vis_outer_dia && autoPoints.vis_outer_dia.length === 2) {
+            drawLine(autoPoints.vis_outer_dia, 'yellow', 3 / scale, []);
+            ctx.fillStyle = 'yellow';
+            ctx.beginPath(); ctx.arc(autoPoints.vis_outer_dia[0][0], autoPoints.vis_outer_dia[0][1], 5/scale, 0, 2*Math.PI); ctx.fill();
+            ctx.beginPath(); ctx.arc(autoPoints.vis_outer_dia[1][0], autoPoints.vis_outer_dia[1][1], 5/scale, 0, 2*Math.PI); ctx.fill();
+        }
+        if (autoPoints.vis_core_dia && autoPoints.vis_core_dia.length === 2) {
+            drawLine(autoPoints.vis_core_dia, '#e056fd', 3 / scale, []);
+            ctx.fillStyle = '#e056fd';
+            ctx.beginPath(); ctx.arc(autoPoints.vis_core_dia[0][0], autoPoints.vis_core_dia[0][1], 5/scale, 0, 2*Math.PI); ctx.fill();
+            ctx.beginPath(); ctx.arc(autoPoints.vis_core_dia[1][0], autoPoints.vis_core_dia[1][1], 5/scale, 0, 2*Math.PI); ctx.fill();
+        }
+
+        // Manual Points
+        manualPoints.forEach((p, index) => {
+            ctx.beginPath();
+            let markerSizeMan = 8 / scale; 
+            ctx.arc(p.x, p.y, markerSizeMan, 0, 2 * Math.PI); 
+            ctx.fillStyle = index < 2 ? '#ff9f43' : '#54a0ff'; 
+            ctx.fill();
+            ctx.lineWidth = 2 / scale;
+            ctx.strokeStyle = 'white';
+            ctx.stroke();
+            
+            ctx.fillStyle = "#ffeaa7";
+            ctx.font = `bold ${20/scale}px Arial`;
+            let label = index < 2 ? "MP" + (index+1) : "MV" + (index-1);
+            ctx.fillText(label, p.x + (12/scale), p.y);
+        });
+
+        ctx.restore();
+    }
+
+    function drawLine(points, color, width, dash = []) {
+        ctx.beginPath();
+        ctx.moveTo(points[0][0], points[0][1]);
+        ctx.lineTo(points[1][0], points[1][1]);
+        ctx.lineWidth = width;
+        ctx.strokeStyle = color;
+        ctx.setLineDash(dash);
+        ctx.stroke();
+        ctx.setLineDash([]); 
+    }
+
+    container.addEventListener('mousedown', (e) => {
+        isDragging = true;
+        startX = e.clientX - pX;
+        startY = e.clientY - pY;
+    });
+
+    window.addEventListener('mousemove', (e) => {
+        if(isDragging) {
+            pX = e.clientX - startX;
+            pY = e.clientY - startY;
+            draw();
+        }
+    });
+
+    window.addEventListener('mouseup', () => { isDragging = false; });
+    window.addEventListener('mouseleave', () => { isDragging = false; });
+
+    container.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        let zoomIntensity = 0.1;
+        let wheel = e.deltaY < 0 ? 1 : -1;
+        let zoom = Math.exp(wheel * zoomIntensity);
+        let rect = canvas.getBoundingClientRect();
+        let mouseX = e.clientX - rect.left;
+        let mouseY = e.clientY - rect.top;
+        pX = mouseX - (mouseX - pX) * zoom;
+        pY = mouseY - (mouseY - pY) * zoom;
+        scale *= zoom;
+        draw();
+    });
+
+    container.addEventListener('click', (e) => {
+        if(isDragging) return; 
+        if(manualPoints.length >= 4) return;
+
+        let rect = canvas.getBoundingClientRect();
+        let screenX = e.clientX - rect.left;
+        let screenY = e.clientY - rect.top;
+        let imgX = (screenX - pX) / scale;
+        let imgY = (screenY - pY) / scale;
+
+        if(imgX >= 0 && imgX <= img.width && imgY >= 0 && imgY <= img.height) {
+            manualPoints.push({x: imgX, y: imgY});
+            draw();
+            
+            const steps = ["Click Peak 2", "Click Valley 1", "Click Valley 2", "Calculating..."];
+            let idx = manualPoints.length;
+            if(idx < 4) {
+                document.getElementById('instructionText').innerText = steps[idx-1];
+            } else {
+                sendManualPoints();
+            }
+        }
+    });
+
+    function resetPoints() {
+        manualPoints = [];
+        document.getElementById('manualResults').style.display = 'none';
+        document.getElementById('instructionText').innerText = "Manual Mode: Click Peak 1";
+        draw();
+    }
+
+    async function sendManualPoints() {
+        try {
+            let ptArray = manualPoints.map(p => [p.x, p.y]);
+            let resp = await fetch('/calculate_manual', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ points: ptArray })
+            });
+            
+            if (!resp.ok) {
+                let err = await resp.json();
+                alert("Calculation Error: " + (err.error || "Unknown error"));
+                resetPoints();
+                return;
+            }
+
+            let res = await resp.json();
+            document.getElementById('manualResults').style.display = 'block';
+            document.getElementById('finalPitch').innerText = res.pitch_mm + " mm";
+            document.getElementById('finalDepth').innerText = res.depth_mm + " mm";
+            document.getElementById('instructionText').innerText = "Manual Calculation Complete.";
+        } catch (e) {
+            console.error(e);
+            alert("Failed to calculate manual points. Check console.");
+        }
+    }
+</script>
+</body>
+</html>
